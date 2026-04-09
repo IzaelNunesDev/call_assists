@@ -1,0 +1,53 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Production / Bundles
+dist/
+out/
+release/
+build/
+
+# Vite / Tools
+.vite/
+.vercel
+.netlify
+.next
+
+# Whisper Engine / Local Data (Dev/Test)
+whisper-engine/
+whisper-engine-test/
+whisper.zip
+*.wav
+*.json
+*.txt
+!package.json
+!package-lock.json
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# VS Code / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+build_error.txt
+cli_help.txt
+cmd_help.txt
+stream_help.txt
+stream_out.txt
+test-dl.js
+latest_release.json
