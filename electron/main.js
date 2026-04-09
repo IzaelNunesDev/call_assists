@@ -5,8 +5,6 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
-const extractZip = require('extract-zip');
-const FormData = require('form-data');
 const { GoogleGenAI } = require('@google/genai');
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -81,6 +79,7 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
   isCapturing = false;
+  stopSidecar();
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 
@@ -104,124 +103,313 @@ ipcMain.handle('protection:toggle', (_, enabled) => {
   return isProtected;
 });
 
-// ─── Whisper Setup & Download ─────────────────────────────────────────────────
+// ─── Engine directory (shared between whisper.cpp legacy and faster-whisper) ─
 const engineDir = path.join(app.getPath('userData'), 'whisper-engine');
-// URL correta do release cublas para whisper.cpp v1.8.4 (CUDA 12.4 — compatível com GTX 1650 CC7.5)
-const streamExeUrl = 'https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-cublas-12.4.0-bin-x64.zip';
+if (!fs.existsSync(engineDir)) fs.mkdirSync(engineDir, { recursive: true });
 
-const HF_BASE = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main';
-const WHISPER_MODELS = {
-  base: { file: 'ggml-base.bin', size: '74MB' },
-  small: { file: 'ggml-small.bin', size: '244MB' },
-  medium: { file: 'ggml-medium.bin', size: '769MB' },
-  'large-v3-turbo': { file: 'ggml-large-v3-turbo.bin', size: '809MB' },
-};
-
-function getModelInfo(modelKey) {
-  return WHISPER_MODELS[modelKey] || WHISPER_MODELS['small'];
+// ─── Progress helper ──────────────────────────────────────────────────────────
+function notify(msg) {
+  if (mainWindow) mainWindow.webContents.send('download:progress', msg);
+  console.log(`[setup] ${msg}`);
 }
 
-const https = require('https');
+// ─── Python helpers ───────────────────────────────────────────────────────────
 
-function downloadFile(url, dest, updateMsg, retries = 4) {
+/**
+ * Runs a command, captures stdout+stderr, returns {code, stdout, stderr}.
+ * Uses shell:false so Python -c args are never split by cmd.exe.
+ */
+function runSilent(exe, args, opts = {}) {
+  return new Promise((resolve) => {
+    const proc = spawn(exe, args, { shell: false, windowsHide: true, ...opts });
+    let stdout = '', stderr = '';
+    proc.stdout?.on('data', d => stdout += d.toString());
+    proc.stderr?.on('data', d => stderr += d.toString());
+    proc.on('error', () => resolve({ code: 1, stdout, stderr }));
+    proc.on('close', code => resolve({ code: code ?? 1, stdout, stderr }));
+  });
+}
+
+/** Runs a command, streams output to console, rejects on non-zero exit. */
+function runStreaming(exe, args, progressPrefix = '') {
   return new Promise((resolve, reject) => {
-    if (mainWindow) mainWindow.webContents.send('download:progress', updateMsg);
-    console.log(`Baixando URL: ${url} para ${dest}`);
+    console.log(`[setup] $ ${exe} ${args.join(' ')}`);
+    const proc = spawn(exe, args, { shell: false, windowsHide: true });
 
-    const options = new URL(url);
-    const reqOptions = {
-      hostname: options.hostname,
-      path: options.pathname + options.search,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) call-assists/1.0' },
-    };
-
-    https.get(reqOptions, (response) => {
-      console.log(`HTTP Status [${url}]: ${response.statusCode}`);
-      if (response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 307 || response.statusCode === 308) {
-        return downloadFile(response.headers.location, dest, updateMsg, retries).then(resolve).catch(reject);
-      }
-      if (response.statusCode === 429) {
-        response.resume();
-        if (retries <= 0) return reject(new Error(`Rate limit do servidor após várias tentativas`));
-        const wait = (5 - retries) * 5000 + 5000; // 5s, 10s, 15s, 20s
-        console.log(`Rate limit (429). Aguardando ${wait / 1000}s antes de retry (${retries} tentativas restantes)...`);
-        if (mainWindow) mainWindow.webContents.send('download:progress', `Rate limit. Aguardando ${wait / 1000}s...`);
-        setTimeout(() => downloadFile(url, dest, updateMsg, retries - 1).then(resolve).catch(reject), wait);
-        return;
-      }
-      if (response.statusCode >= 400) {
-        return reject(new Error(`Falha ao baixar ${url} (HTTP ${response.statusCode})`));
-      }
-
-      const fileStream = fs.createWriteStream(dest);
-      response.pipe(fileStream);
-
-      fileStream.on('finish', () => {
-        fileStream.close();
-        console.log(`Download concluído: ${dest}`);
-        resolve();
-      });
-
-      fileStream.on('error', (err) => {
-        console.error(`Erro ao escrever arquivo ${dest}:`, err);
-        fs.unlink(dest, () => reject(err));
-      });
-    }).on('error', (err) => {
-      console.error(`Erro na requisição HTTPS para ${url}:`, err);
-      fs.unlink(dest, () => reject(err));
+    proc.stdout?.on('data', d => {
+      const text = d.toString().trim();
+      if (!text) return;
+      console.log(text);
+      // Forward last non-empty line to the UI
+      const last = text.split('\n').filter(Boolean).pop() ?? '';
+      if (last) notify(`${progressPrefix}${last.slice(0, 70)}`);
+    });
+    proc.stderr?.on('data', d => {
+      const text = d.toString().trim();
+      if (text) console.log(text);
+    });
+    proc.on('error', reject);
+    proc.on('close', code => {
+      if (code !== 0) reject(new Error(`Comando saiu com código ${code}: ${exe} ${args.join(' ')}`));
+      else resolve();
     });
   });
 }
 
-// Helper to find whisper-cli.exe
-function getCliExePath() {
-  const dirs = [path.join(engineDir, 'Release'), engineDir];
-  for (const dir of dirs) {
-    const p = path.join(dir, 'whisper-cli.exe');
-    if (fs.existsSync(p)) return p;
+/**
+ * Returns the full path to a Python 3.8+ executable.
+ * On Windows the Python Launcher (py) is tried first, then python/python3.
+ * Uses shell:false so the -c argument is never split by cmd.exe.
+ */
+async function findPython() {
+  const candidates = [
+    { cmd: 'py',      vargs: ['-3', '--version'], pargs: ['-3', '-c', 'import sys\nprint(sys.executable)'] },
+    { cmd: 'python',  vargs: ['--version'],        pargs: ['-c',       'import sys\nprint(sys.executable)'] },
+    { cmd: 'python3', vargs: ['--version'],        pargs: ['-c',       'import sys\nprint(sys.executable)'] },
+  ];
+
+  for (const { cmd, vargs, pargs } of candidates) {
+    try {
+      const vr = await runSilent(cmd, vargs);
+      if (vr.code !== 0) continue;
+      const ver = (vr.stdout + vr.stderr).trim();
+      // Accept Python 3.8 and above (handles 3.8, 3.9, 3.10 … 3.13+)
+      if (!/Python 3\.([89]|[1-9]\d)/.test(ver)) continue;
+
+      const pr = await runSilent(cmd, pargs);
+      if (pr.code !== 0) continue;
+      const exePath = pr.stdout.trim();
+      if (!exePath) continue;
+
+      console.log(`[setup] Python: ${ver}  →  ${exePath}`);
+      return exePath;
+    } catch (_) { /* try next candidate */ }
   }
-  return path.join(engineDir, 'Release', 'whisper-cli.exe');
+
+  throw new Error(
+    'Python 3.8+ não encontrado.\n' +
+    'Instale em https://python.org (marque "Add to PATH") e reinicie o app.'
+  );
 }
 
-ipcMain.handle('whisper:setup', async (_, { model } = {}) => {
-  if (!fs.existsSync(engineDir)) fs.mkdirSync(engineDir, { recursive: true });
+// ─── Faster-Whisper Setup ─────────────────────────────────────────────────────
 
-  const cliPath = getCliExePath();
-  const info = getModelInfo(model);
-  const modelPath = path.join(engineDir, info.file);
+const VENV_DIR    = path.join(engineDir, 'fw-env');
+const VENV_PYTHON = path.join(VENV_DIR, 'Scripts', 'python.exe');
+const SERVER_DEST = path.join(engineDir, 'transcribe_server.py');
+const MODEL_DIR   = path.join(engineDir, 'fw-models');
+
+ipcMain.handle('whisper:setup', async (_, { model } = {}) => {
+  const modelSize = model || 'small';
 
   try {
-    if (!fs.existsSync(cliPath)) {
-      const zipPath = path.join(engineDir, 'whisper.zip');
-      await downloadFile(streamExeUrl, zipPath, 'Baixando engine Whisper (x64)...');
-      if (mainWindow) mainWindow.webContents.send('download:progress', 'Extraindo engine...');
-      await extractZip(zipPath, { dir: engineDir });
-      fs.unlinkSync(zipPath);
+    // ── 1. Find system Python ─────────────────────────────────────────────────
+    notify('Verificando Python...');
+    const sysPython = await findPython();
+
+    // ── 2. Create venv (once) ─────────────────────────────────────────────────
+    if (!fs.existsSync(VENV_PYTHON)) {
+      notify('Criando ambiente virtual Python...');
+      await runStreaming(sysPython, ['-m', 'venv', VENV_DIR]);
+      console.log('[setup] Venv criado em:', VENV_DIR);
+    } else {
+      console.log('[setup] Venv já existe:', VENV_DIR);
     }
 
-    if (!fs.existsSync(modelPath)) {
-      const url = `${HF_BASE}/${info.file}`;
-      await downloadFile(url, modelPath, `Baixando modelo ${model || 'small'} (${info.size})...`);
+    // ── 3. Install / upgrade faster-whisper + CUDA 12 runtime libs ───────────
+    const check = await runSilent(VENV_PYTHON, ['-c', 'import faster_whisper; print(faster_whisper.__version__)']);
+    if (check.code !== 0) {
+      notify('Instalando faster-whisper (ctranslate2 + CUDA DLLs ~400 MB, aguarde)...');
+      await runStreaming(
+        VENV_PYTHON,
+        ['-m', 'pip', 'install', '--upgrade', 'faster-whisper'],
+        'pip: '
+      );
+      console.log('[setup] faster-whisper instalado com sucesso');
+    } else {
+      console.log(`[setup] faster-whisper já instalado: v${check.stdout.trim()}`);
     }
 
-    if (mainWindow) mainWindow.webContents.send('download:progress', 'Pronto!');
+    // Install CUDA 12 runtime libs as pip packages so the GPU works without a
+    // system-wide CUDA Toolkit install.  nvidia-cublas-cu12 pulls in
+    // nvidia-cuda-runtime-cu12 as a dependency; nvidia-cudnn-cu12 is needed
+    // for float16 compute types.
+    const cudaCheck = await runSilent(VENV_PYTHON, [
+      '-c', 'import nvidia.cublas; import nvidia.cudnn; print("ok")',
+    ]);
+    if (cudaCheck.code !== 0) {
+      notify('Instalando CUDA 12 runtime (cuBLAS + cuDNN ~600 MB, aguarde)...');
+      await runStreaming(
+        VENV_PYTHON,
+        ['-m', 'pip', 'install', '--upgrade',
+          'nvidia-cublas-cu12', 'nvidia-cudnn-cu12'],
+        'pip cuda: '
+      );
+      console.log('[setup] CUDA runtime instalado com sucesso');
+    } else {
+      console.log('[setup] CUDA runtime (cuBLAS + cuDNN) já instalado');
+    }
+
+    // ── 4. Copy sidecar script to engineDir ───────────────────────────────────
+    const serverSrc = path.join(__dirname, '..', 'python', 'transcribe_server.py');
+    fs.copyFileSync(serverSrc, SERVER_DEST);
+    console.log('[setup] transcribe_server.py → ', SERVER_DEST);
+
+    // ── 5. Ensure model cache directory exists ────────────────────────────────
+    if (!fs.existsSync(MODEL_DIR)) fs.mkdirSync(MODEL_DIR, { recursive: true });
+
+    // ── 6. Start (or restart) the persistent sidecar process ─────────────────
+    notify(`Carregando modelo '${modelSize}' na GPU (primeira vez faz download ~244 MB)...`);
+    await startSidecar(modelSize);
+
+    notify('Pronto!');
     return { success: true };
+
   } catch (err) {
-    console.error('Erro no setup do Whisper:', err);
+    console.error('[setup] ERRO:', err.message);
     return { success: false, error: err.message };
   }
 });
 
-// ─── Captura de Áudio do Sistema + Transcrição (desktopCapturer → whisper-cli) ─
+// ─── Faster-Whisper Sidecar ───────────────────────────────────────────────────
 
-let isCapturing = false;
+let sidecarProcess      = null;
+let sidecarReady        = false;
+let sidecarModel        = null;   // which model is currently loaded
+let sidecarPendingResolve = null; // resolve for the in-flight transcription request
+let sidecarStdoutBuf    = '';     // partial-line buffer
+
+/**
+ * Starts (or restarts) the Python sidecar with the given model.
+ * Resolves when the sidecar sends {"status":"ready"}.
+ */
+function startSidecar(modelSize) {
+  // Nothing to do if the same model is already running
+  if (sidecarProcess && sidecarReady && sidecarModel === modelSize) {
+    console.log(`[sidecar] Já em execução com modelo '${modelSize}' — reutilizando`);
+    return Promise.resolve();
+  }
+
+  // Kill existing process if model changed
+  if (sidecarProcess) {
+    console.log('[sidecar] Modelo diferente — reiniciando sidecar...');
+    stopSidecar();
+  }
+
+  if (!fs.existsSync(VENV_PYTHON)) {
+    return Promise.reject(new Error('Venv não encontrado. Execute o setup primeiro.'));
+  }
+  if (!fs.existsSync(SERVER_DEST)) {
+    return Promise.reject(new Error('transcribe_server.py não encontrado no engineDir.'));
+  }
+
+  const env = {
+    ...process.env,
+    FW_MODEL:       modelSize,
+    FW_DEVICE:      'cuda',
+    FW_COMPUTE:     'int8_float16',
+    FW_MODEL_DIR:   MODEL_DIR,
+    FW_CPU_THREADS: String(Math.max(4, os.cpus().length / 2 | 0)),
+    PYTHONUNBUFFERED:   '1',
+    PYTHONIOENCODING:   'utf-8',
+    // Desativa o protocolo XetHub do HuggingFace Hub (usa HTTP padrão para model.bin)
+    HF_HUB_DISABLE_XET: '1',
+  };
+
+  console.log(`[sidecar] Iniciando — modelo='${modelSize}'`);
+
+  sidecarProcess   = spawn(VENV_PYTHON, [SERVER_DEST], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  sidecarReady     = false;
+  sidecarModel     = modelSize;
+  sidecarStdoutBuf = '';
+
+  return new Promise((resolve, reject) => {
+    // 10-minute timeout (first run downloads the CTranslate2 model)
+    const timeout = setTimeout(() => {
+      reject(new Error('[sidecar] Timeout de 10 min aguardando inicialização'));
+    }, 10 * 60 * 1000);
+
+    // ── stdout: JSON protocol ─────────────────────────────────────────────────
+    sidecarProcess.stdout.on('data', d => {
+      sidecarStdoutBuf += d.toString('utf8');
+      const parts = sidecarStdoutBuf.split('\n');
+      sidecarStdoutBuf = parts.pop(); // keep incomplete trailing line
+
+      for (const line of parts) {
+        if (!line.trim()) continue;
+        let msg;
+        try { msg = JSON.parse(line); }
+        catch { console.warn('[sidecar] JSON inválido ignorado:', line); continue; }
+
+        if (msg.status === 'ready') {
+          clearTimeout(timeout);
+          sidecarReady = true;
+          console.log(
+            `[sidecar] ✓ Pronto!  device=${msg.device}  compute=${msg.compute}  model=${msg.model}`
+          );
+          resolve();
+        } else if (sidecarPendingResolve) {
+          const cb = sidecarPendingResolve;
+          sidecarPendingResolve = null;
+          cb(msg);
+        } else {
+          console.warn('[sidecar] Resposta inesperada sem requisição pendente:', line);
+        }
+      }
+    });
+
+    // ── stderr: diagnostic logs forwarded verbatim ────────────────────────────
+    sidecarProcess.stderr.on('data', d => {
+      const text = d.toString('utf8');
+      // Log every line from the Python process
+      text.split('\n').forEach(l => { if (l.trim()) console.log(l); });
+      // Forward progress keywords to the UI overlay
+      if (/baixando|downloading|carregando|loading|pronto|ready/i.test(text)) {
+        const last = text.split('\n').filter(Boolean).pop()?.replace(/^\[fw\]\s*\w+\s+/, '') ?? '';
+        if (last) notify(last.slice(0, 80));
+      }
+    });
+
+    // ── process error / exit ──────────────────────────────────────────────────
+    sidecarProcess.on('error', err => {
+      console.error('[sidecar] Erro no processo:', err.message);
+      clearTimeout(timeout);
+      sidecarReady   = false;
+      sidecarProcess = null;
+      if (sidecarPendingResolve) { sidecarPendingResolve({ error: err.message, lines: [] }); sidecarPendingResolve = null; }
+      reject(err);
+    });
+
+    sidecarProcess.on('exit', (code, signal) => {
+      console.log(`[sidecar] Processo encerrado (code=${code}, signal=${signal})`);
+      sidecarReady   = false;
+      sidecarProcess = null;
+      if (sidecarPendingResolve) {
+        sidecarPendingResolve({ error: 'Sidecar encerrado inesperadamente', lines: [] });
+        sidecarPendingResolve = null;
+      }
+    });
+  });
+}
+
+/** Gracefully stops the sidecar (closes stdin, then force-kills after 3 s). */
+function stopSidecar() {
+  if (!sidecarProcess) return;
+  console.log('[sidecar] Encerrando...');
+  try { sidecarProcess.stdin.end(); } catch (_) {}
+  const proc = sidecarProcess;
+  sidecarProcess = null;
+  sidecarReady   = false;
+  setTimeout(() => { try { proc.kill(); } catch (_) {} }, 3000);
+}
+
+// ─── Captura de Áudio do Sistema + Transcrição ────────────────────────────────
+
+let isCapturing  = false;
 let whisperQueue = Promise.resolve();
-let activeModel = 'small';
-let activeProvider = 'local';
-let lastPromptText = '';
-let whisperInitLogged = false; // loga inicialização CUDA/CPU apenas no 1º chunk
+let activeModel  = 'small';
 
-// Encode PCM Int16 samples into a valid WAV buffer
+/** Encode raw PCM Int16 samples into a WAV buffer. */
 function encodeWAV(int16Buffer, sampleRate) {
   const dataLen = int16Buffer.byteLength;
   const buf = Buffer.alloc(44 + dataLen);
@@ -230,124 +418,93 @@ function encodeWAV(int16Buffer, sampleRate) {
   buf.write('WAVE', 8, 'ascii');
   buf.write('fmt ', 12, 'ascii');
   buf.writeUInt32LE(16, 16);
-  buf.writeUInt16LE(1, 20);               // PCM
-  buf.writeUInt16LE(1, 22);               // mono
+  buf.writeUInt16LE(1, 20);              // PCM
+  buf.writeUInt16LE(1, 22);             // mono
   buf.writeUInt32LE(sampleRate, 24);
-  buf.writeUInt32LE(sampleRate * 2, 28);  // byte rate
-  buf.writeUInt16LE(2, 32);               // block align
-  buf.writeUInt16LE(16, 34);              // bits per sample
+  buf.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  buf.writeUInt16LE(2, 32);             // block align
+  buf.writeUInt16LE(16, 34);            // bits per sample
   buf.write('data', 36, 'ascii');
   buf.writeUInt32LE(dataLen, 40);
   Buffer.from(int16Buffer).copy(buf, 44);
   return buf;
 }
 
-function runWhisperCli(wavFile, language) {
+/**
+ * Sends a WAV file to the persistent sidecar and waits for the transcription.
+ * The whisperQueue already serialises calls, so we never have two in-flight.
+ */
+function runFasterWhisper(wavFile, language) {
   return new Promise((resolve) => {
-    const cliPath = getCliExePath();
-    const modelPath = path.join(engineDir, getModelInfo(activeModel).file);
-
-    if (!fs.existsSync(cliPath) || !fs.existsSync(modelPath)) {
-      console.error('whisper-cli.exe ou modelo não encontrado');
+    if (!sidecarProcess || !sidecarReady) {
+      console.error('[sidecar] Processo não disponível — chunk ignorado');
       return resolve([]);
     }
 
-    const args = [
-      '-m', modelPath,
-      '-f', wavFile,
-      '-l', language || 'pt',
-      '-t', '4',
-      '--no-timestamps',
-    ];
-
-    // --prompt desativado: causa alucinações (letras/sílabas soltas) em chunks curtos
-    const proc = spawn(cliPath, args, { cwd: path.dirname(cliPath) });
-
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', d => stdout += d.toString('utf8'));
-    proc.stderr.on('data', d => stderr += d.toString('utf8'));
-    proc.on('error', err => { console.error('whisper-cli error:', err); resolve([]); });
-    proc.on('close', () => {
-      if (!whisperInitLogged && stderr) {
-        whisperInitLogged = true;
-        // Filtra linhas relevantes: CUDA, device, backend, model load
-        const relevant = stderr.split('\n').filter(l =>
-          /cuda|CUDA|device|backend|metal|cpu|CPU|load|model|ggml/i.test(l)
-        );
-        if (relevant.length) console.log('[whisper init]\n' + relevant.join('\n'));
-        else console.log('[whisper init]\n' + stderr.slice(0, 500));
+    sidecarPendingResolve = (msg) => {
+      if (msg.error) {
+        console.error(`[sidecar] Erro na transcrição: ${msg.error}`);
+        return resolve([]);
       }
-
-      const lines = stdout.split('\n')
-        .map(l => l.replace(/^\[[\d:.,]+ --> [\d:.]+\]\s*/, '').trim())
-        .filter(l => l && l !== '(silence)' && l !== '[BLANK_AUDIO]' && !l.startsWith('whisper_'));
-
-      // Atualizar o prompt com as últimas falas deste chunk (máx ~400 chars)
+      const { lines = [], elapsed_ms, lang_detected } = msg;
       if (lines.length > 0) {
-        const combined = lines.join(' ');
-        lastPromptText = combined.length > 400 ? combined.slice(-400) : combined;
+        console.log(`[sidecar] ${elapsed_ms} ms  |  ${lines.length} linha(s)  |  lang=${lang_detected}`);
       }
-
       resolve(lines);
-    });
+    };
+
+    sidecarProcess.stdin.write(
+      JSON.stringify({ file: wavFile, language: language || 'pt' }) + '\n'
+    );
   });
 }
 
-
-// Transcreve via insanely-fast-whisper local (GPU)
-// Roteador: local (whisper-cli)
 function transcribeChunk(wavFile, language) {
-  return runWhisperCli(wavFile, language);
+  return runFasterWhisper(wavFile, language);
 }
 
-// Retorna fontes de tela para getUserMedia no renderer
+// ─── IPC: Desktop Sources ─────────────────────────────────────────────────────
 ipcMain.handle('desktop:get-sources', async () => {
   const { desktopCapturer } = require('electron');
   const sources = await desktopCapturer.getSources({ types: ['screen'] });
   return sources.map(s => ({ id: s.id, name: s.name }));
 });
 
-// Inicia o modo de captura
+// ─── IPC: Capture Start / Stop ────────────────────────────────────────────────
 ipcMain.handle('capture:start', (_, { language, model }) => {
-  isCapturing = true;
-  activeModel = model || 'small';
-  activeProvider = 'local';
-  lastPromptText = '';
+  isCapturing  = true;
+  activeModel  = model || 'small';
   whisperQueue = Promise.resolve();
-  console.log(`Captura iniciada. Provider: ${activeProvider}, Idioma: ${language}, Modelo: ${activeModel}`);
+  console.log(`[capture] Iniciada  idioma=${language}  modelo=${activeModel}  sidecar=${sidecarReady ? 'pronto' : 'NÃO PRONTO'}`);
   return { success: true };
 });
 
-// Para a captura
 ipcMain.handle('capture:stop', () => {
   isCapturing = false;
-  lastPromptText = '';
-  console.log('Captura parada.');
+  console.log('[capture] Parada.');
   return true;
 });
 
-// Recebe chunks de áudio PCM Int16 do renderer, salva como WAV e transcreve
+// ─── IPC: Audio PCM Chunks ────────────────────────────────────────────────────
 ipcMain.on('audio:pcm-chunk', (event, { buffer, sampleRate, language }) => {
   if (!isCapturing) return;
 
-  const tmpFile = path.join(os.tmpdir(), `ca_${Date.now()}_${Math.random().toString(36).slice(2)}.wav`);
-  const wav = encodeWAV(buffer, sampleRate);
-  fs.writeFileSync(tmpFile, wav);
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `ca_${Date.now()}_${Math.random().toString(36).slice(2)}.wav`
+  );
+  fs.writeFileSync(tmpFile, encodeWAV(buffer, sampleRate));
 
-  // Fila sequencial: evita rodar dois whisper-cli ao mesmo tempo
+  // Serial queue — never runs two transcriptions concurrently
   whisperQueue = whisperQueue.then(async () => {
-    if (!isCapturing) { fs.unlink(tmpFile, () => { }); return; }
+    if (!isCapturing) { fs.unlink(tmpFile, () => {}); return; }
     const lines = await transcribeChunk(tmpFile, language);
-    fs.unlink(tmpFile, () => { });
+    fs.unlink(tmpFile, () => {});
     for (const line of lines) {
-      if (!event.sender.isDestroyed()) {
-        event.sender.send('transcribe:chunk', line);
-      }
+      if (!event.sender.isDestroyed()) event.sender.send('transcribe:chunk', line);
     }
   });
 });
-
 
 // ─── IPC: AI Chat (Gemini) ────────────────────────────────────────────────────
 ipcMain.handle('chat:send', async (event, { messages, transcript, apiKey }) => {
@@ -366,7 +523,6 @@ ${transcript || '(Ainda não há transcrição disponível)'}
 ───────────────────────────────
 Responda sempre em português do Brasil de forma concisa.`;
 
-  // Suporte a mensagens com imagem (screenshot)
   const formattedMessages = messages.map(m => {
     const parts = [{ text: m.content || '' }];
     if (m.image) {
@@ -378,14 +534,15 @@ Responda sempre em português do Brasil de forma concisa.`;
 
   try {
     const stream = await ai.models.generateContentStream({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-3.1-flash-lite-preview',
       contents: formattedMessages,
       config: {
         systemInstruction: { parts: [{ text: systemContent }] },
         temperature: 0.7,
+        topP: 0.9,
+        maxOutputTokens: 1024,
       },
     });
-
     for await (const chunk of stream) {
       if (chunk.text) event.sender.send('chat:stream-chunk', chunk.text);
     }
@@ -396,18 +553,18 @@ Responda sempre em português do Brasil de forma concisa.`;
   }
 });
 
-// ─── IPC: Compressão de Transcrição / Chat ────────────────────────────────────
-// Usado tanto para comprimir chunks antigos da transcrição quanto para comprimir o histórico do chat
+// ─── IPC: Compressão de Transcrição ──────────────────────────────────────────
 ipcMain.handle('ai:compress', async (_, { text, prompt, apiKey }) => {
   if (!apiKey) return { error: 'API Key não configurada' };
   if (!text?.trim()) return { error: 'Sem conteúdo para comprimir' };
 
   const ai = new GoogleGenAI({ apiKey });
-  const finalPrompt = prompt || `Crie um resumo denso e completo do seguinte trecho de reunião, preservando todos os pontos discutidos, decisões, nomes próprios e dados técnicos. O resumo será usado como contexto comprimido:\n\n${text}`;
+  const finalPrompt = prompt ||
+    `Crie um resumo denso e completo do seguinte trecho de reunião, preservando todos os pontos discutidos, decisões, nomes próprios e dados técnicos. O resumo será usado como contexto comprimido:\n\n${text}`;
 
   try {
     const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-lite',
+      model: 'gemini-3.1-flash-lite-preview',
       contents: [{ role: 'user', parts: [{ text: finalPrompt }] }],
     });
     return { summary: result.text };
@@ -437,7 +594,7 @@ ipcMain.handle('history:save', (_, { filename, content }) => {
   if (!fs.existsSync(histDir)) fs.mkdirSync(histDir, { recursive: true });
   const filePath = path.join(histDir, filename);
   fs.writeFileSync(filePath, content, 'utf8');
-  console.log('Histórico salvo:', filePath);
+  console.log('[history] Salvo:', filePath);
   return { path: filePath };
 });
 
@@ -459,7 +616,7 @@ ipcMain.handle('summary:generate', async (_, { transcript, apiKey }) => {
       model: 'gemini-3.1-flash-lite-preview',
       contents: [{
         role: 'user',
-        parts: [{ text: `Resuma esta reunião em pt-br contendo: Resumo Executivo, Pontos Principais, Decisões e Próximos Passos.\n\n${transcript}` }]
+        parts: [{ text: `Resuma esta reunião em pt-br contendo: Resumo Executivo, Pontos Principais, Decisões e Próximos Passos.\n\n${transcript}` }],
       }],
     });
     return { summary: result.text };

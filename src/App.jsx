@@ -530,7 +530,7 @@ function ChatPanel({ apiKey, getFullTranscript, openSettings, hasHistory, onOpen
       {messages.length === 0 ? (
         <div className="chat-empty">
           <div className="chat-empty-icon">🤖</div>
-          <p>Gemini 2.0 Flash<br/>Contexto da reunião transferido automaticamente.<br/>Use 📸 para enviar print da tela.</p>
+          <p>Gemini 3.1 Flash Lite<br/>Contexto da reunião transferido automaticamente.<br/>Use 📸 para enviar print da tela.</p>
         </div>
       ) : (
         <div className="chat-messages">
