@@ -106,7 +106,8 @@ ipcMain.handle('protection:toggle', (_, enabled) => {
 
 // ─── Whisper Setup & Download ─────────────────────────────────────────────────
 const engineDir = path.join(app.getPath('userData'), 'whisper-engine');
-const streamExeUrl = 'https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.4/whisper-bin-cublas-cu12.2.0-x64.zip';
+// URL correta do release cublas para whisper.cpp v1.8.4 (CUDA 12.4 — compatível com GTX 1650 CC7.5)
+const streamExeUrl = 'https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-cublas-12.4.0-bin-x64.zip';
 
 const HF_BASE = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main';
 const WHISPER_MODELS = {
@@ -122,15 +123,31 @@ function getModelInfo(modelKey) {
 
 const https = require('https');
 
-function downloadFile(url, dest, updateMsg) {
+function downloadFile(url, dest, updateMsg, retries = 4) {
   return new Promise((resolve, reject) => {
     if (mainWindow) mainWindow.webContents.send('download:progress', updateMsg);
     console.log(`Baixando URL: ${url} para ${dest}`);
 
-    https.get(url, (response) => {
+    const options = new URL(url);
+    const reqOptions = {
+      hostname: options.hostname,
+      path: options.pathname + options.search,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) call-assists/1.0' },
+    };
+
+    https.get(reqOptions, (response) => {
       console.log(`HTTP Status [${url}]: ${response.statusCode}`);
       if (response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 307 || response.statusCode === 308) {
-        return downloadFile(response.headers.location, dest, updateMsg).then(resolve).catch(reject);
+        return downloadFile(response.headers.location, dest, updateMsg, retries).then(resolve).catch(reject);
+      }
+      if (response.statusCode === 429) {
+        response.resume();
+        if (retries <= 0) return reject(new Error(`Rate limit do servidor após várias tentativas`));
+        const wait = (5 - retries) * 5000 + 5000; // 5s, 10s, 15s, 20s
+        console.log(`Rate limit (429). Aguardando ${wait / 1000}s antes de retry (${retries} tentativas restantes)...`);
+        if (mainWindow) mainWindow.webContents.send('download:progress', `Rate limit. Aguardando ${wait / 1000}s...`);
+        setTimeout(() => downloadFile(url, dest, updateMsg, retries - 1).then(resolve).catch(reject), wait);
+        return;
       }
       if (response.statusCode >= 400) {
         return reject(new Error(`Falha ao baixar ${url} (HTTP ${response.statusCode})`));
@@ -176,7 +193,7 @@ ipcMain.handle('whisper:setup', async (_, { model } = {}) => {
   try {
     if (!fs.existsSync(cliPath)) {
       const zipPath = path.join(engineDir, 'whisper.zip');
-      await downloadFile(streamExeUrl, zipPath, 'Baixando engine Whisper (NVIDIA GPU)...');
+      await downloadFile(streamExeUrl, zipPath, 'Baixando engine Whisper (x64)...');
       if (mainWindow) mainWindow.webContents.send('download:progress', 'Extraindo engine...');
       await extractZip(zipPath, { dir: engineDir });
       fs.unlinkSync(zipPath);
@@ -202,6 +219,7 @@ let whisperQueue = Promise.resolve();
 let activeModel = 'small';
 let activeProvider = 'local';
 let lastPromptText = '';
+let whisperInitLogged = false; // loga inicialização CUDA/CPU apenas no 1º chunk
 
 // Encode PCM Int16 samples into a valid WAV buffer
 function encodeWAV(int16Buffer, sampleRate) {
@@ -242,18 +260,25 @@ function runWhisperCli(wavFile, language) {
       '--no-timestamps',
     ];
 
-    // Passa as últimas falas como contexto para o Whisper continuar corretamente
-    if (lastPromptText) {
-      args.push('--prompt', lastPromptText);
-    }
-
+    // --prompt desativado: causa alucinações (letras/sílabas soltas) em chunks curtos
     const proc = spawn(cliPath, args, { cwd: path.dirname(cliPath) });
 
     let stdout = '';
+    let stderr = '';
     proc.stdout.on('data', d => stdout += d.toString('utf8'));
-    proc.stderr.on('data', () => { });
+    proc.stderr.on('data', d => stderr += d.toString('utf8'));
     proc.on('error', err => { console.error('whisper-cli error:', err); resolve([]); });
     proc.on('close', () => {
+      if (!whisperInitLogged && stderr) {
+        whisperInitLogged = true;
+        // Filtra linhas relevantes: CUDA, device, backend, model load
+        const relevant = stderr.split('\n').filter(l =>
+          /cuda|CUDA|device|backend|metal|cpu|CPU|load|model|ggml/i.test(l)
+        );
+        if (relevant.length) console.log('[whisper init]\n' + relevant.join('\n'));
+        else console.log('[whisper init]\n' + stderr.slice(0, 500));
+      }
+
       const lines = stdout.split('\n')
         .map(l => l.replace(/^\[[\d:.,]+ --> [\d:.]+\]\s*/, '').trim())
         .filter(l => l && l !== '(silence)' && l !== '[BLANK_AUDIO]' && !l.startsWith('whisper_'));

@@ -3,7 +3,6 @@ import { useState, useRef, useEffect } from 'react';
 // ── Utilitários de Áudio ──────────────────────────────────────────────────────
 
 const TARGET_SR = 16000;
-const CHUNK_SECONDS = 10; // chunks maiores = menos cortes de frase + mais contexto por inferência
 
 
 function floatToInt16(floatSamples) {
@@ -44,7 +43,7 @@ export default function App() {
   const pcmBufRef = useRef(new Float32Array(0));
 
   useEffect(() => {
-    window.electronAPI.loadSettings().then(setSettings);
+    window.electronAPI.loadSettings().then(s => setSettings(prev => ({ ...prev, ...s })));
 
     const removeShortcutToggle = window.electronAPI.onShortcut('toggle-recording', () => {
       toggleRecording();
@@ -142,8 +141,8 @@ export default function App() {
     setSetupVisible(true);
     setSetupProgress('Verificando Whisper.cpp...');
 
-    // Groq não precisa do setup do whisper local
-    if (settings.transcribeProvider === 'local') {
+    // Qualquer provider diferente de 'groq' usa whisper local
+    if (settings.transcribeProvider !== 'groq') {
       const setupRes = await window.electronAPI.setupWhisper({ model: settings.whisperModel });
       if (!setupRes.success) {
         setSetupProgress('Erro: ' + setupRes.error);
@@ -210,8 +209,6 @@ export default function App() {
           sum += input[i] * input[i];
         }
         const rms = Math.sqrt(sum / input.length);
-        // Debug do volume para calibragem do SILENCE_THRESHOLD
-        if (rms > 0) console.log('RMS:', rms.toFixed(4));
 
         // 2. Acumular o áudio no buffer contínuo
         const cur = pcmBufRef.current;
@@ -628,7 +625,7 @@ function SettingsModal({ settings, setSettings, onClose }) {
             value={localSettings.transcribeProvider || 'local'}
             onChange={e => setLocalSettings({ ...localSettings, transcribeProvider: e.target.value })}
           >
-            <option value="local">Local — Whisper.cpp (offline, CPU)</option>
+            <option value="local">Local — Whisper.cpp (offline, GPU CUDA)</option>
           </select>
         </div>
 
