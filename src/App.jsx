@@ -5,22 +5,6 @@ import { useState, useRef, useEffect } from 'react';
 const TARGET_SR = 16000;
 const CHUNK_SECONDS = 10; // chunks maiores = menos cortes de frase + mais contexto por inferência
 
-function linearResample(samples, fromRate, toRate) {
-  if (fromRate === toRate) return samples instanceof Float32Array ? samples : new Float32Array(samples);
-  const ratio = fromRate / toRate;
-  const newLength = Math.round(samples.length / ratio);
-  const out = new Float32Array(newLength);
-  const len = samples.length;
-  for (let i = 0; i < newLength; i++) {
-    const pos = i * ratio;
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    const a = idx < len ? samples[idx] : 0;
-    const b = idx + 1 < len ? samples[idx + 1] : 0;
-    out[i] = a + frac * (b - a);
-  }
-  return out;
-}
 
 function floatToInt16(floatSamples) {
   const out = new Int16Array(floatSamples.length);
@@ -166,6 +150,7 @@ export default function App() {
         setTimeout(() => setSetupVisible(false), 3000);
         return;
       }
+    }
 
     setSetupProgress('Iniciando captura de áudio do sistema...');
 
@@ -201,33 +186,60 @@ export default function App() {
       stream.getVideoTracks().forEach(t => t.stop());
       streamRef.current = stream;
 
-      const audioCtx = new AudioContext();
+      // Força o navegador a fazer o downsampling com alta qualidade nativa em C++
+      const audioCtx = new AudioContext({ sampleRate: TARGET_SR });
       audioCtxRef.current = audioCtx;
-      const nativeSr = audioCtx.sampleRate;
-      const chunkSamples = nativeSr * CHUNK_SECONDS;
-
+      
       const source = audioCtx.createMediaStreamSource(stream);
       const processor = audioCtx.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
-      pcmBufRef.current = new Float32Array(0); // Float32Array para acúmulo eficiente
+      pcmBufRef.current = new Float32Array(0);
+
+      // --- Configurações do Corte Inteligente (VAD) ---
+      let silenceDuration = 0;
+      const SILENCE_THRESHOLD = 0.015; // Sensibilidade de volume (ajuste se não estiver cortando)
+      const MIN_CHUNK_SAMPLES = TARGET_SR * 3;  // Mínimo de 3 segundos para enviar
+      const MAX_CHUNK_SAMPLES = TARGET_SR * 15; // Máximo de 15s (evita delay infinito se ninguém pausar)
 
       processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0); // já é Float32Array
-        const cur = pcmBufRef.current;
+        const input = e.inputBuffer.getChannelData(0);
 
-        // Concatenação eficiente sem push individual
+        // 1. Calcular o volume (Root Mean Square - RMS) deste pequeno fragmento
+        let sum = 0;
+        for (let i = 0; i < input.length; i++) {
+          sum += input[i] * input[i];
+        }
+        const rms = Math.sqrt(sum / input.length);
+        // Debug do volume para calibragem do SILENCE_THRESHOLD
+        if (rms > 0) console.log('RMS:', rms.toFixed(4));
+
+        // 2. Acumular o áudio no buffer contínuo
+        const cur = pcmBufRef.current;
         const merged = new Float32Array(cur.length + input.length);
         merged.set(cur);
         merged.set(input, cur.length);
+        pcmBufRef.current = merged;
 
-        if (merged.length >= chunkSamples) {
-          const chunk = merged.subarray(0, chunkSamples);
-          pcmBufRef.current = merged.subarray(chunkSamples); // guardar o restante
-          const resampled = linearResample(chunk, nativeSr, TARGET_SR);
-          const int16 = floatToInt16(resampled);
-          window.electronAPI.sendAudioChunk(int16.buffer, TARGET_SR, settings.language);
+        // 3. Detectar se é silêncio ou fala
+        if (rms < SILENCE_THRESHOLD) {
+          silenceDuration += (input.length / TARGET_SR); // Adiciona segundos de silêncio
         } else {
-          pcmBufRef.current = merged;
+          silenceDuration = 0; // Alguém está falando, reseta o cronômetro de silêncio
+        }
+
+        // 4. Lógica de Envio: Tem áudio suficiente E houve uma pausa de 1 segundo? OU bateu limite de 15s?
+        const hasEnoughAudio = merged.length >= MIN_CHUNK_SAMPLES;
+        const isSilent = silenceDuration > 1.0; 
+        const reachedMax = merged.length >= MAX_CHUNK_SAMPLES;
+
+        if ((hasEnoughAudio && isSilent) || reachedMax) {
+          // O navegador já garantiu que está em 16kHz, não precisamos de linearResample
+          const int16 = floatToInt16(merged); 
+          window.electronAPI.sendAudioChunk(int16.buffer, TARGET_SR, settings.language);
+
+          // Reseta o buffer principal e o silêncio para o próximo lote de fala
+          pcmBufRef.current = new Float32Array(0);
+          silenceDuration = 0;
         }
       };
 
@@ -284,7 +296,7 @@ export default function App() {
       <div className="titlebar">
         <div className="titlebar-icon">🕵️</div>
         <div className="titlebar-name">CallAssist</div>
-        <div className="shield-badge" title="Invisibilidade no Screen Share" onClick={toggleProtection} className={`shield-badge ${isProtected ? 'on' : 'off'}`}>
+        <div title="Invisibilidade no Screen Share" onClick={toggleProtection} className={`shield-badge ${isProtected ? 'on' : 'off'}`}>
            {isProtected ? '🛡️ Invisível' : '👁️ Visível'}
         </div>
         <div className="titlebar-controls ml-auto">

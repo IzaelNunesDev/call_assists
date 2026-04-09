@@ -258,10 +258,10 @@ function runWhisperCli(wavFile, language) {
         .map(l => l.replace(/^\[[\d:.,]+ --> [\d:.]+\]\s*/, '').trim())
         .filter(l => l && l !== '(silence)' && l !== '[BLANK_AUDIO]' && !l.startsWith('whisper_'));
 
-      // Atualizar o prompt com as últimas falas deste chunk (máx ~200 chars)
+      // Atualizar o prompt com as últimas falas deste chunk (máx ~400 chars)
       if (lines.length > 0) {
         const combined = lines.join(' ');
-        lastPromptText = combined.length > 200 ? combined.slice(-200) : combined;
+        lastPromptText = combined.length > 400 ? combined.slice(-400) : combined;
       }
 
       resolve(lines);
