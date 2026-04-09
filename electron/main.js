@@ -106,7 +106,7 @@ ipcMain.handle('protection:toggle', (_, enabled) => {
 
 // ─── Whisper Setup & Download ─────────────────────────────────────────────────
 const engineDir = path.join(app.getPath('userData'), 'whisper-engine');
-const streamExeUrl = 'https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip';
+const streamExeUrl = 'https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.4/whisper-bin-cublas-cu12.2.0-x64.zip';
 
 const HF_BASE = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main';
 const WHISPER_MODELS = {
@@ -176,7 +176,7 @@ ipcMain.handle('whisper:setup', async (_, { model } = {}) => {
   try {
     if (!fs.existsSync(cliPath)) {
       const zipPath = path.join(engineDir, 'whisper.zip');
-      await downloadFile(streamExeUrl, zipPath, 'Baixando engine Whisper (x64)...');
+      await downloadFile(streamExeUrl, zipPath, 'Baixando engine Whisper (NVIDIA GPU)...');
       if (mainWindow) mainWindow.webContents.send('download:progress', 'Extraindo engine...');
       await extractZip(zipPath, { dir: engineDir });
       fs.unlinkSync(zipPath);
