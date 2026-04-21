@@ -60,6 +60,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ── Summary ───────────────────────────────────────────────
   generateSummary: (data) => ipcRenderer.invoke('summary:generate', data),
 
+  // ── Transcrição de Vídeo OBS ──────────────────────────────
+  pickVideoFile: () => ipcRenderer.invoke('video:pick-file'),
+  transcribeVideo: (data) => ipcRenderer.invoke('video:transcribe', data),
+  onVideoProgress: (cb) => {
+    const handler = (_, msg) => cb(msg);
+    ipcRenderer.on('video:progress', handler);
+    return () => ipcRenderer.removeListener('video:progress', handler);
+  },
+
   // ── Global Shortcuts ──────────────────────────────────────
   onShortcut: (name, cb) => {
     const handler = () => cb();

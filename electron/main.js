@@ -1,5 +1,5 @@
 const {
-  app, BrowserWindow, ipcMain, globalShortcut, session, screen: electronScreen, shell,
+  app, BrowserWindow, ipcMain, globalShortcut, session, screen: electronScreen, shell, dialog,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -602,6 +602,95 @@ ipcMain.handle('history:open-folder', () => {
   const histDir = path.join(app.getPath('userData'), 'transcripts');
   if (!fs.existsSync(histDir)) fs.mkdirSync(histDir, { recursive: true });
   shell.openPath(histDir);
+});
+
+// ─── IPC: Transcrição de Vídeo OBS ───────────────────────────────────────────
+
+ipcMain.handle('video:pick-file', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Selecionar vídeo OBS',
+    filters: [
+      { name: 'Vídeo', extensions: ['mp4', 'mkv', 'avi', 'mov', 'flv', 'webm', 'ts'] },
+      { name: 'Todos os arquivos', extensions: ['*'] },
+    ],
+    properties: ['openFile'],
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle('video:transcribe', async (event, { filePath, language }) => {
+  const sendProgress = (msg) => {
+    if (!event.sender.isDestroyed()) event.sender.send('video:progress', msg);
+  };
+
+  if (!sidecarReady) {
+    return { error: 'Motor Whisper não está pronto. Inicie e pare uma gravação ao vivo primeiro para configurá-lo.' };
+  }
+  if (isCapturing) {
+    return { error: 'Pare a gravação ao vivo antes de transcrever um vídeo.' };
+  }
+
+  const tmpWav = path.join(os.tmpdir(), `obs_video_${Date.now()}.wav`);
+
+  try {
+    // 1. Verificar ffmpeg
+    sendProgress('Verificando ffmpeg...');
+    const ffmpegCheck = await runSilent('ffmpeg', ['-version']);
+    if (ffmpegCheck.code !== 0) {
+      return { error: 'ffmpeg não encontrado. Instale o ffmpeg e adicione ao PATH do sistema. Download: https://ffmpeg.org/download.html' };
+    }
+
+    // 2. Extrair áudio para WAV 16kHz mono
+    sendProgress('Extraindo áudio do vídeo...');
+    await new Promise((resolve, reject) => {
+      const proc = spawn('ffmpeg', [
+        '-i', filePath,
+        '-ar', '16000',
+        '-ac', '1',
+        '-f', 'wav',
+        '-y',
+        tmpWav,
+      ], { shell: false, windowsHide: true });
+      proc.on('error', (err) => reject(new Error(`Erro ao iniciar ffmpeg: ${err.message}`)));
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg falhou (código ${code}). Verifique se o arquivo de vídeo é válido.`));
+      });
+    });
+
+    // 3. Aguardar queue de áudio ao vivo drenar (segurança)
+    await whisperQueue;
+
+    // 4. Transcrever com faster-whisper
+    sendProgress('Transcrevendo com Whisper (pode levar vários minutos para vídeos longos)...');
+    const lines = await runFasterWhisper(tmpWav, language || 'pt');
+
+    if (!lines.length) {
+      return { error: 'Nenhum texto detectado. Verifique se o vídeo contém áudio audível.' };
+    }
+
+    // 5. Montar conteúdo
+    const text = lines.join('\n');
+    const videoName = path.basename(filePath, path.extname(filePath)).replace(/[<>:"/\\|?*]/g, '_');
+    const now = new Date();
+    const stamp = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}-${String(now.getMinutes()).padStart(2,'0')}`;
+    const filename = `video_${videoName}_${stamp}.txt`;
+
+    // 6. Salvar em disco
+    const histDir = path.join(app.getPath('userData'), 'transcripts');
+    if (!fs.existsSync(histDir)) fs.mkdirSync(histDir, { recursive: true });
+    const savePath = path.join(histDir, filename);
+    const header = `TRANSCRIÇÃO DE VÍDEO OBS\nArquivo: ${path.basename(filePath)}\nData: ${now.toLocaleString('pt-BR')}\n${'─'.repeat(50)}\n\n`;
+    fs.writeFileSync(savePath, header + text, 'utf8');
+
+    sendProgress('Concluído!');
+    return { text, savedPath: savePath, filename, lineCount: lines.length };
+  } catch (err) {
+    return { error: err.message };
+  } finally {
+    try { if (fs.existsSync(tmpWav)) fs.unlinkSync(tmpWav); } catch (_) {}
+  }
 });
 
 // ─── IPC: Meeting Summary ─────────────────────────────────────────────────────

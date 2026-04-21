@@ -197,8 +197,8 @@ export default function App() {
       // --- Configurações do Corte Inteligente (VAD) ---
       let silenceDuration = 0;
       const SILENCE_THRESHOLD = 0.015; // Sensibilidade de volume (ajuste se não estiver cortando)
-      const MIN_CHUNK_SAMPLES = TARGET_SR * 3;  // Mínimo de 3 segundos para enviar
-      const MAX_CHUNK_SAMPLES = TARGET_SR * 15; // Máximo de 15s (evita delay infinito se ninguém pausar)
+      const MIN_CHUNK_SAMPLES = TARGET_SR * 20; // Mínimo de 20 segundos para enviar
+      const MAX_CHUNK_SAMPLES = TARGET_SR * 40; // Máximo de 40s (evita delay infinito se ninguém pausar)
 
       processor.onaudioprocess = (e) => {
         const input = e.inputBuffer.getChannelData(0);
@@ -305,17 +305,23 @@ export default function App() {
 
       {/* Tabs */}
       <div className="tabs">
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'transcript' ? 'active' : ''}`}
           onClick={() => setActiveTab('transcript')}
         >
           📝 Notas
         </button>
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'chat' ? 'active' : ''}`}
           onClick={() => setActiveTab('chat')}
         >
           🤖 Chat IA
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'video' ? 'active' : ''}`}
+          onClick={() => setActiveTab('video')}
+        >
+          📹 Vídeo
         </button>
       </div>
 
@@ -327,7 +333,7 @@ export default function App() {
              isRecording={isRecording}
              hasCompressed={!!compressedContextRef.current}
            />
-        ) : (
+        ) : activeTab === 'chat' ? (
            <ChatPanel
              apiKey={settings.apiKey}
              getFullTranscript={getFullTranscriptText}
@@ -335,6 +341,8 @@ export default function App() {
              hasHistory={fullHistoryRef.current.length > 0}
              onOpenHistory={() => window.electronAPI.openHistoryFolder()}
            />
+        ) : (
+           <VideoPanel settings={settings} />
         )}
       </div>
 
@@ -575,6 +583,127 @@ function ChatPanel({ apiKey, getFullTranscript, openSettings, hasHistory, onOpen
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function VideoPanel({ settings }) {
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [progress, setProgress] = useState('');
+  const [transcriptText, setTranscriptText] = useState('');
+  const [savedPath, setSavedPath] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const unsub = window.electronAPI.onVideoProgress((msg) => setProgress(msg));
+    return () => unsub();
+  }, []);
+
+  const handlePickFile = async () => {
+    const filePath = await window.electronAPI.pickVideoFile();
+    if (filePath) {
+      setSelectedFile(filePath);
+      setTranscriptText('');
+      setSavedPath('');
+      setError('');
+    }
+  };
+
+  const handleTranscribe = async () => {
+    if (!selectedFile || isTranscribing) return;
+    setIsTranscribing(true);
+    setError('');
+    setTranscriptText('');
+    setProgress('Iniciando...');
+
+    const result = await window.electronAPI.transcribeVideo({
+      filePath: selectedFile,
+      language: settings.language,
+    });
+
+    setIsTranscribing(false);
+    if (result.error) {
+      setError(result.error);
+      setProgress('');
+    } else {
+      setTranscriptText(result.text);
+      setSavedPath(result.savedPath);
+    }
+  };
+
+  const fileName = selectedFile ? selectedFile.split(/[\\/]/).pop() : null;
+
+  return (
+    <div className="transcript-panel">
+      {/* Seletor de arquivo */}
+      <div style={{ padding: '10px', borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: '8px', flexShrink: 0 }}>
+        <button className="btn btn-ghost" style={{ width: '100%' }} onClick={handlePickFile} disabled={isTranscribing}>
+          📂 Selecionar Vídeo OBS
+        </button>
+        {fileName && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'var(--bg-card)', borderRadius: 'var(--r-md)', padding: '6px 10px', border: '1px solid var(--border)' }}>
+            <span style={{ fontSize: '11px', color: 'var(--text-2)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              🎬 {fileName}
+            </span>
+            <button
+              className="btn btn-primary"
+              style={{ fontSize: '11px', padding: '4px 10px', flexShrink: 0 }}
+              onClick={handleTranscribe}
+              disabled={isTranscribing}
+            >
+              {isTranscribing ? '⏳...' : '▶ Transcrever'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Progresso */}
+      {isTranscribing && (
+        <div style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '8px', background: 'var(--accent-dim)', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
+          <div className="spinner" style={{ flexShrink: 0 }} />
+          <span style={{ fontSize: '11px', color: 'var(--accent-lite)' }}>{progress}</span>
+        </div>
+      )}
+
+      {/* Erro */}
+      {error && (
+        <div style={{ padding: '8px 12px', fontSize: '11px', color: 'var(--danger)', background: 'var(--danger-dim)', borderBottom: '1px solid rgba(239,68,68,0.2)', flexShrink: 0 }}>
+          ⚠️ {error}
+        </div>
+      )}
+
+      {/* Conteúdo transcrito */}
+      {transcriptText ? (
+        <>
+          <div className="transcript-list" style={{ flex: 1 }}>
+            {transcriptText.split('\n').filter(Boolean).map((line, i) => (
+              <div key={i} className="transcript-item">
+                <div className="transcript-text">{line}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ padding: '8px 10px', borderTop: '1px solid var(--border)', display: 'flex', gap: '6px', alignItems: 'center', flexShrink: 0 }}>
+            <span style={{ fontSize: '10px', color: 'var(--text-3)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={savedPath}>
+              💾 {savedPath.split(/[\\/]/).pop()}
+            </span>
+            <button className="btn btn-ghost" style={{ fontSize: '11px' }} title="Copiar texto" onClick={() => navigator.clipboard.writeText(transcriptText)}>
+              📋
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: '11px' }} title="Abrir pasta de transcrições" onClick={() => window.electronAPI.openHistoryFolder()}>
+              📂
+            </button>
+          </div>
+        </>
+      ) : !selectedFile && !isTranscribing && !error ? (
+        <div className="transcript-empty">
+          <div className="transcript-empty-icon">🎬</div>
+          <p>Selecione um vídeo gravado pelo OBS.<br />O áudio será extraído e transcrito com Whisper.</p>
+          <div style={{ fontSize: '10px', color: 'var(--text-3)', marginTop: '6px' }}>
+            Requer: ffmpeg no PATH + motor Whisper configurado<br />(inicie uma gravação ao vivo uma vez para configurar)
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
